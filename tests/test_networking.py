@@ -163,3 +163,96 @@ def test_set_on_connect(monkeypatch: pytest.MonkeyPatch) -> None:
     communications.setOnDisconnect(hook)
     assert networking.onConnect is hook
     assert networking.onDisconnect is hook
+
+
+# --- behobene Fehler ------------------------------------------------------------
+
+def test_server_close_with_connected_client_returns(server: networking.Server) -> None:
+    client = networking.Client("localhost", server.port, 1024, "pickle", debug=0)
+    assert _wait_for(lambda: client.name == "1")
+    started = time.monotonic()
+    server.close()
+    assert time.monotonic() - started < 5
+    assert _wait_for(lambda: not client.threads[0].is_alive())
+    client.close()
+    server.close = lambda: None  # type: ignore[method-assign]
+
+
+def test_send_all_skips_dead_clients(server: networking.Server) -> None:
+    client = networking.Client("localhost", server.port, 1024, "pickle", debug=0)
+    assert _wait_for(lambda: len(server.clients) == 1)
+    client.close()
+    server.sendAll(networking.Message("server", "userMessage", "noch da?"))
+    assert _wait_for(lambda: server.clients == [])
+
+
+def test_full_server_does_not_spin(monkeypatch: pytest.MonkeyPatch) -> None:
+    accepted: list[int] = []
+    server = networking.Server("localhost", _free_port(), 1024, "pickle", 0)
+    monkeypatch.setattr(server, "connect", lambda: accepted.append(1))
+    time.sleep(0.5)
+    server.close()
+    assert accepted == []
+
+
+def test_names_are_reused_lowest_first(server: networking.Server) -> None:
+    first = networking.Client("localhost", server.port, 1024, "pickle", debug=0)
+    second = networking.Client("localhost", server.port, 1024, "pickle", debug=0)
+    try:
+        assert _wait_for(lambda: {first.name, second.name} == {"1", "2"})
+        first.close()
+        assert _wait_for(lambda: server.unusedNames == ["1"])
+        third = networking.Client("localhost", server.port, 1024, "pickle", debug=0)
+        assert _wait_for(lambda: third.name == "1")
+        third.close()
+    finally:
+        second.close()
+
+
+@pytest.mark.parametrize("encoding", ["xml", ""])
+def test_unknown_encoding_raises(encoding: str) -> None:
+    with pytest.raises(ValueError):
+        networking.encode(networking.Message("a", "b", "c"), encoding)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        networking.decode(b"{}", encoding)  # type: ignore[arg-type]
+
+
+def test_pickle_rejects_non_message() -> None:
+    import pickle
+    with pytest.raises(TypeError):
+        networking.decode(pickle.dumps({"kein": "Message"}), "pickle")
+
+
+def test_frame_survives_timeout_in_the_middle() -> None:
+    left, right = socket.socketpair()
+    try:
+        right.settimeout(0.05)
+        payload = networking.encode(networking.Message("a", "b", "x" * 10), "json")
+        left.sendall(struct.pack(">I", len(payload)) + payload[:5])
+
+        def rest() -> None:
+            time.sleep(0.2)
+            left.sendall(payload[5:])
+
+        import threading
+        threading.Thread(target=rest).start()
+        assert networking._recv_frame(right) == payload
+    finally:
+        left.close()
+        right.close()
+
+
+def test_role_methods_raise_on_wrong_side() -> None:
+    port = _free_port()
+    host = communications.CommunicationsHandler(host=True, port=port)
+    try:
+        with pytest.raises(RuntimeError):
+            host.sendRequest(communications.Request("x", 1))
+        assert host.getName() is None
+    finally:
+        host.quit()
+
+
+def test_request_compares_only_with_request() -> None:
+    assert communications.Request("x", 1) != "x"
+    assert communications.Event("x", 1) != communications.Request("x", 1)
