@@ -256,3 +256,44 @@ def test_role_methods_raise_on_wrong_side() -> None:
 def test_request_compares_only_with_request() -> None:
     assert communications.Request("x", 1) != "x"
     assert communications.Event("x", 1) != communications.Request("x", 1)
+
+
+# --- Verzögerung --------------------------------------------------------------------
+
+def test_sockets_disable_nagle(server: networking.Server) -> None:
+    client = networking.Client("localhost", server.port, 1024, "pickle", debug=0)
+    try:
+        assert _wait_for(lambda: len(server.clients) == 1)
+        assert client.client_socket.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != 0
+        assert server.clients[0].conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != 0
+    finally:
+        client.close()
+
+
+def test_parallel_sends_keep_frames_intact(server: networking.Server) -> None:
+    import threading
+    received: list[str] = []
+    server.messageFunctions["teil"] = lambda sender, content: received.append(content)
+    client = networking.Client("localhost", server.port, 1024, "pickle", debug=0)
+    try:
+        assert _wait_for(lambda: client.name == "1")
+        senders = [threading.Thread(target=lambda tag=tag: [client.send(networking.Message("1", "teil", tag * 20_000))
+                                                             for _ in range(20)]) for tag in "abcd"]
+        for sender in senders:
+            sender.start()
+        for sender in senders:
+            sender.join()
+        assert _wait_for(lambda: len(received) == 80)
+        assert all(len(set(text)) == 1 and len(text) == 20_000 for text in received)
+    finally:
+        client.close()
+
+
+def test_close_is_fast(server: networking.Server) -> None:
+    client = networking.Client("localhost", server.port, 1024, "pickle", debug=0)
+    assert _wait_for(lambda: client.name == "1")
+    started = time.monotonic()
+    client.close()
+    server.close()
+    assert time.monotonic() - started < 0.5
+    server.close = lambda: None  # type: ignore[method-assign]

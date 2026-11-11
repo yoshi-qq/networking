@@ -1,0 +1,37 @@
+# Changelog
+
+Versionen nach [SemVer](https://semver.org/lang/de/). Datum TT.MM.JJJJ.
+
+## 1.1.1 – 11.11.2026
+
+Weniger Verzögerung, Verhalten unverändert.
+
+### Schneller
+- `TCP_NODELAY` auf beiden Seiten: kleine Nachrichten gehen sofort raus, statt auf weitere Daten zu warten. Wirkt im echten Netz; auf localhost nicht messbar.
+- `Client.close()` und `Server.close()` wecken die wartenden Threads sofort, statt auf die 1-Sekunden-Abfrage zu warten.
+- Empfang ohne wiederholtes Aneinanderhängen von Bytes; pickle mit dem schnellsten Protokoll.
+- `bench/bench_latency.py` misst Rundreise, Durchsatz, Request→Event und Schließen.
+
+### Behoben
+- Gleichzeitiges Senden aus mehreren Threads über denselben Socket konnte Rahmen vermischen; jetzt eine Sperre je Socket.
+
+Messung auf localhost (Median):
+
+| | 1.1.0 | 1.1.1 |
+|---|---|---|
+| Rundreise pickle, klein | 0,091 ms | 0,096 ms |
+| Rundreise json, klein | 0,113 ms | 0,108 ms |
+| Rundreise pickle, 2 MB | 7,2 ms | 8,0 ms |
+| Durchsatz pickle | 33 200 /s | 31 500 /s |
+| Request → Event | 1,6 ms | 2,0 ms |
+| Schließen Client+Server | 2025 ms | 0,8 ms |
+
+Auf localhost liegen Rundreise und Durchsatz im Rauschen; Request → Event wird von der 1-ms-Abfrage des Messskripts bestimmt.
+
+## 1.1.0 – 11.11.2026
+
+Vollständig typisiert (`mypy --strict`), bekannte Fehler behoben: `Server.close()` hing bei verbundenen Clients, voller Server lastete einen Kern aus, Nachrichten mit Pause gingen verloren, getrennte Clients ließen `sendAll()` abstürzen, Client-Liste threadsicher, klare Fehler bei unbekannter Kodierung. `getRequests()`/`getEvents()` geben Kopien zurück.
+
+## 1.0.0 – 11.11.2026
+
+Erste Fassung als Paket, aus der val2d-Kopie (Längenpräfix) und communications 1.2.

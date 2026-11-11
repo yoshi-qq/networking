@@ -12,6 +12,7 @@ import socket
 import struct
 import threading
 import time
+import weakref
 from typing import Any, Callable, Literal, Optional
 
 Encoding = Literal["json", "pickle"]
@@ -20,6 +21,11 @@ MessageFunction = Callable[[str, Any], None]
 _HEADER = struct.Struct(">I")
 _POLL_SECONDS = 1.0
 _FULL_SERVER_WAIT_SECONDS = 0.1
+_PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
+
+# Mehrere Threads dürfen über denselben Socket senden; ohne Sperre könnten sich Rahmen vermischen.
+_send_locks: weakref.WeakKeyDictionary[socket.socket, threading.Lock] = weakref.WeakKeyDictionary()
+_send_locks_guard = threading.Lock()
 
 
 def onConnect(this: "Server.Client") -> None:
@@ -34,18 +40,20 @@ def onDisconnect(this: "Server.Client") -> None:
 
 def _recv_all(conn: socket.socket, size: int) -> bytes:
     """Liest genau size Bytes. Ein Timeout nach den ersten Bytes bricht den Rahmen nicht ab."""
-    buf = b""
-    while len(buf) < size:
+    buf = bytearray(size)
+    view = memoryview(buf)
+    received = 0
+    while received < size:
         try:
-            chunk = conn.recv(size - len(buf))
+            count = conn.recv_into(view[received:], size - received)
         except TimeoutError:
-            if not buf:
+            if received == 0:
                 raise
             continue
-        if not chunk:
+        if count == 0:
             raise ConnectionError("Socket closed during frame reception")
-        buf += chunk
-    return buf
+        received += count
+    return bytes(buf)
 
 
 def _recv_frame(conn: socket.socket) -> bytes:
@@ -62,8 +70,26 @@ def _recv_frame_body(conn: socket.socket, length: int) -> bytes:
             continue
 
 
+def _send_lock(conn: socket.socket) -> threading.Lock:
+    with _send_locks_guard:
+        lock = _send_locks.get(conn)
+        if lock is None:
+            lock = _send_locks[conn] = threading.Lock()
+        return lock
+
+
 def _send_frame(conn: socket.socket, data: bytes) -> None:
-    conn.sendall(_HEADER.pack(len(data)) + data)
+    frame = _HEADER.pack(len(data)) + data
+    with _send_lock(conn):
+        conn.sendall(frame)
+
+
+def _low_latency(conn: socket.socket) -> None:
+    """Kleine Nachrichten sofort senden, nicht auf weitere Daten warten (Nagle aus)."""
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
 
 
 class Message:
@@ -165,6 +191,10 @@ class Server:
 
     def close(self) -> None:
         self.on = False
+        try:
+            self.server_socket.close()
+        except OSError:
+            pass
         with self._lock:
             clients = list(self.clients)
         for client in clients:
@@ -177,7 +207,6 @@ class Server:
             if thread is not threading.current_thread():
                 thread.join()
         self.threads.clear()
-        self.server_socket.close()
         print("Server closed")
 
     def connectLoop(self) -> None:
@@ -205,8 +234,11 @@ class Server:
         except TimeoutError as error:
             return error
         except OSError:
+            if self.on:
+                time.sleep(_FULL_SERVER_WAIT_SECONDS)
             return None
         conn.settimeout(None)
+        _low_latency(conn)
         self.Client(self, conn, addr)
         return None
 
@@ -250,6 +282,7 @@ class Client:
 
     def connect(self, host: str, port: int) -> None:
         self.client_socket = socket.create_connection((host, port))
+        _low_latency(self.client_socket)
         if self.debug > 0:
             print(f"Connected to host: {self.host}: port {self.port}")
         recv_thread = threading.Thread(target=self.receive_messages, args=(self.client_socket,), daemon=True)
@@ -260,14 +293,14 @@ class Client:
 
     def close(self) -> None:
         self.on = False
-        for thread in list(self.threads):
-            if thread is not threading.current_thread():
-                thread.join()
-        self.threads.clear()
         try:
             self.client_socket.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+        for thread in list(self.threads):
+            if thread is not threading.current_thread():
+                thread.join()
+        self.threads.clear()
         self.client_socket.close()
         print("Disconnected")
 
@@ -284,7 +317,7 @@ class Client:
     def receive_messages(self, sock: socket.socket) -> None:
         if self.debug > 0:
             print("Now receiving messages")
-        sock.settimeout(_POLL_SECONDS)
+        sock.settimeout(None)
         while self.on:
             try:
                 message = self.receive()
@@ -323,7 +356,7 @@ def encode(message: Message, type: Encoding) -> bytes:
         payload = {"sender": message.sender, "type": message.type, "content": message.content}
         return json.dumps(payload).encode("utf-8")
     if type == "pickle":
-        return pickle.dumps(message)
+        return pickle.dumps(message, protocol=_PICKLE_PROTOCOL)
     raise ValueError(f"Unbekannte Kodierung: {type!r}")
 
 
