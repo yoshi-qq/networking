@@ -5,6 +5,7 @@ Der Host sammelt Requests der Clients in einer Warteschlange und verteilt Events
 from __future__ import annotations
 
 from enum import Enum
+import warnings
 from threading import Lock
 from time import time as now
 from typing import Any, Callable, Optional, Union
@@ -50,9 +51,24 @@ class Event:
         return f"Event[head={self.head}, body={self.body}]"
 
 
+def _notify(callback: Callable[[Any], None], item: Any) -> None:
+    try:
+        callback(item)
+    except Exception as error:
+        warnings.warn(f"Rückruf {getattr(callback, '__name__', callback)!r} fehlgeschlagen: {error!r}",
+                      RuntimeWarning, stacklevel=2)
+
+
 class CommunicationsHandler:
     def __init__(self, host: bool = False, ip: str = "localhost", port: int = 54321, maxClients: int = 4,
-                 dataSize: int = 1024, commands: Optional[dict[str, MessageFunction]] = None) -> None:
+                 dataSize: int = 1024, commands: Optional[dict[str, MessageFunction]] = None, *,
+                 on_request: Optional[Callable[[Request], None]] = None,
+                 on_event: Optional[Callable[[Event], None]] = None) -> None:
+        """on_request (Host) und on_event (Client) werden im Empfangs-Thread gerufen, sobald etwas in der
+        Warteschlange liegt. Die Warteschlange bleibt; getRequests/getEvents funktionieren weiter.
+        """
+        self.on_request = on_request
+        self.on_event = on_event
         self.DATA_SIZE = dataSize
         self.__commands: dict[str, MessageFunction] = {} if commands is None else commands
         self._host = host
@@ -78,6 +94,8 @@ class CommunicationsHandler:
             request.id = self.__getId()
             request.signature = sender
             self.__requestQueue.append(request)
+        if self.on_request is not None:
+            _notify(self.on_request, request)
 
     def __addEvent(self, sender: str, event: Event) -> None:
         if sender != HOSTNAME:
@@ -85,6 +103,8 @@ class CommunicationsHandler:
         with self.__queueLock:
             event.id = self.__getId()
             self.__eventQueue.append(event)
+        if self.on_event is not None:
+            _notify(self.on_event, event)
 
     def __initHost(self) -> None:
         server = Server(self._ip, self._port, self.DATA_SIZE, "pickle", self._maxClients)

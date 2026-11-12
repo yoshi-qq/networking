@@ -3,6 +3,7 @@
 Jede Nachricht wird als 4-Byte-Länge (Big Endian) plus Inhalt gesendet.
 Der Inhalt ist JSON (nur einfache Datentypen) oder pickle (beliebige Objekte).
 pickle führt beim Dekodieren Code aus: nur mit vertrauenswürdigen Gegenstellen verwenden.
+Rahmen über ``max_frame`` Bytes werden nicht gelesen; die Verbindung wird getrennt.
 """
 from __future__ import annotations
 
@@ -12,16 +13,23 @@ import socket
 import struct
 import threading
 import time
+import warnings
 import weakref
 from typing import Any, Callable, Literal, Optional
 
 Encoding = Literal["json", "pickle"]
 MessageFunction = Callable[[str, Any], None]
+ConnectionHook = Callable[["Server.Client"], None]
 
 _HEADER = struct.Struct(">I")
 _POLL_SECONDS = 1.0
 _FULL_SERVER_WAIT_SECONDS = 0.1
 _PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
+DEFAULT_MAX_FRAME = 16 * 1024 * 1024
+
+
+class FrameTooLargeError(ConnectionError):
+    """Die Gegenstelle hat einen Rahmen über der erlaubten Größe angekündigt."""
 
 # Mehrere Threads dürfen über denselben Socket senden; ohne Sperre könnten sich Rahmen vermischen.
 _send_locks: weakref.WeakKeyDictionary[socket.socket, threading.Lock] = weakref.WeakKeyDictionary()
@@ -56,8 +64,11 @@ def _recv_all(conn: socket.socket, size: int) -> bytes:
     return bytes(buf)
 
 
-def _recv_frame(conn: socket.socket) -> bytes:
+def _recv_frame(conn: socket.socket, max_frame: Optional[int] = DEFAULT_MAX_FRAME) -> bytes:
+    """Liest einen Rahmen. Ist er größer als max_frame, wird nichts davon gelesen (None: keine Grenze)."""
     (length,) = _HEADER.unpack(_recv_all(conn, _HEADER.size))
+    if max_frame is not None and length > max_frame:
+        raise FrameTooLargeError(f"Rahmen mit {length} Bytes angekündigt, erlaubt sind {max_frame}")
     return _recv_frame_body(conn, length)
 
 
@@ -82,6 +93,15 @@ def _send_frame(conn: socket.socket, data: bytes) -> None:
     frame = _HEADER.pack(len(data)) + data
     with _send_lock(conn):
         conn.sendall(frame)
+
+
+def _call_hook(hook: Callable[[Any], None], argument: Any) -> None:
+    """Fehler in Rückrufen des Nutzers warnen, aber den Netzwerk-Thread nicht beenden."""
+    try:
+        hook(argument)
+    except Exception as error:
+        warnings.warn(f"Rückruf {getattr(hook, '__name__', hook)!r} fehlgeschlagen: {error!r}", RuntimeWarning,
+                      stacklevel=2)
 
 
 def _low_latency(conn: socket.socket) -> None:
@@ -121,7 +141,10 @@ class Server:
 
         def handleClient(self, conn: socket.socket, addr: tuple[str, int]) -> None:
             print(f"Connected with {addr}")
-            onConnect(self)
+            if self.parent.on_connect is not None:
+                _call_hook(self.parent.on_connect, self)
+            else:
+                onConnect(self)
             try:
                 self.parent.send(conn, Message("server", "setName", self.name))
                 while self.parent.on:
@@ -141,10 +164,22 @@ class Server:
                     pass
                 self.parent._release(self)
                 print(f"Disconnected {addr}")
-                onDisconnect(self)
+                if self.parent.on_disconnect is not None:
+                    _call_hook(self.parent.on_disconnect, self)
+                else:
+                    onDisconnect(self)
 
     def __init__(self, host: str, port: int, dataSize: int, encoding: Encoding = "json",
-                 maxConnections: int = 4, console: bool = False) -> None:
+                 maxConnections: int = 4, console: bool = False, *,
+                 max_frame: Optional[int] = DEFAULT_MAX_FRAME, on_connect: Optional[ConnectionHook] = None,
+                 on_disconnect: Optional[ConnectionHook] = None) -> None:
+        """max_frame: größter erlaubter Rahmen in Bytes (None: keine Grenze).
+        on_connect/on_disconnect: Rückrufe nur für diesen Server; ohne sie gelten die Modul-Funktionen
+        onConnect/onDisconnect.
+        """
+        self.max_frame = max_frame
+        self.on_connect = on_connect
+        self.on_disconnect = on_disconnect
         self.threads: list[threading.Thread] = []
         self.on = True
         self.clients: list[Server.Client] = []
@@ -243,7 +278,7 @@ class Server:
         return None
 
     def receive(self, conn: socket.socket, addr: tuple[str, int]) -> Message:
-        return decode(_recv_frame(conn), self.encoding)
+        return decode(_recv_frame(conn, self.max_frame), self.encoding)
 
     def send(self, conn: socket.socket, message: Message) -> None:
         _send_frame(conn, encode(message, self.encoding))
@@ -265,7 +300,9 @@ class Server:
 
 class Client:
     def __init__(self, host: str, port: int, dataSize: int, encoding: Encoding = "json",
-                 console: bool = False, debug: int = 1) -> None:
+                 console: bool = False, debug: int = 1, *, max_frame: Optional[int] = DEFAULT_MAX_FRAME) -> None:
+        """max_frame: größter erlaubter Rahmen in Bytes (None: keine Grenze)."""
+        self.max_frame = max_frame
         self.on = True
         self.threads: list[threading.Thread] = []
         self.host = host
@@ -336,7 +373,7 @@ class Client:
                 print(f"Executed {message.type} from {message.sender}")
 
     def receive(self) -> Message:
-        message = decode(_recv_frame(self.client_socket), self.encoding)
+        message = decode(_recv_frame(self.client_socket, self.max_frame), self.encoding)
         if self.debug > 1:
             print(message)
         return message
@@ -373,4 +410,4 @@ def decode(encoded: bytes, type: Encoding) -> Message:
 
 
 __all__ = ["Message", "Server", "Client", "encode", "decode", "onConnect", "onDisconnect", "Encoding",
-           "MessageFunction"]
+           "MessageFunction", "ConnectionHook", "FrameTooLargeError", "DEFAULT_MAX_FRAME"]

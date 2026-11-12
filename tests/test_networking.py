@@ -26,7 +26,9 @@ def _wait_for(condition: Callable[[], bool], timeout: float = 5.0) -> bool:
 
 
 def _params(func: Callable) -> list[str]:
-    return [p for p in inspect.signature(func).parameters if p != "self"]
+    """Positionelle Parameter; neue Schlüsselwort-Parameter brechen alte Aufrufe nicht."""
+    return [name for name, p in inspect.signature(func).parameters.items()
+            if name != "self" and p.kind is not inspect.Parameter.KEYWORD_ONLY]
 
 
 # --- Schnittstelle ------------------------------------------------------------
@@ -297,3 +299,109 @@ def test_close_is_fast(server: networking.Server) -> None:
     server.close()
     assert time.monotonic() - started < 0.5
     server.close = lambda: None  # type: ignore[method-assign]
+
+
+# --- Phase 2b -------------------------------------------------------------------
+
+def test_oversized_frame_is_rejected_without_reading() -> None:
+    left, right = socket.socketpair()
+    try:
+        left.sendall(struct.pack(">I", 2_000_000_000))
+        with pytest.raises(networking.FrameTooLargeError):
+            networking._recv_frame(right, 1024)
+        assert issubclass(networking.FrameTooLargeError, ConnectionError)
+    finally:
+        left.close()
+        right.close()
+
+
+def test_max_frame_none_means_no_limit() -> None:
+    left, right = socket.socketpair()
+    try:
+        payload = b"x" * 5000
+        left.sendall(struct.pack(">I", len(payload)) + payload)
+        assert networking._recv_frame(right, None) == payload
+    finally:
+        left.close()
+        right.close()
+
+
+def test_server_drops_client_announcing_huge_frame() -> None:
+    server = networking.Server("localhost", _free_port(), 1024, "pickle", 4, max_frame=1024)
+    try:
+        assert server.max_frame == 1024
+        with socket.create_connection(("localhost", server.port), timeout=5) as raw:
+            assert _wait_for(lambda: len(server.clients) == 1)
+            raw.sendall(struct.pack(">I", 10_000_000))
+            assert _wait_for(lambda: len(server.clients) == 0)
+    finally:
+        server.close()
+
+
+def test_client_max_frame_default_and_keyword(server: networking.Server) -> None:
+    client = networking.Client("localhost", server.port, 1024, "pickle", debug=0, max_frame=None)
+    try:
+        assert client.max_frame is None
+        assert networking.DEFAULT_MAX_FRAME == 16 * 1024 * 1024
+        assert server.max_frame == networking.DEFAULT_MAX_FRAME
+    finally:
+        client.close()
+
+
+def test_instance_hooks_replace_module_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    module_calls: list[object] = []
+    monkeypatch.setattr(networking, "onConnect", module_calls.append)
+    monkeypatch.setattr(networking, "onDisconnect", module_calls.append)
+    first: list[str] = []
+    second: list[str] = []
+    a = networking.Server("localhost", _free_port(), 1024, "pickle", 4,
+                          on_connect=lambda c: first.append("an"), on_disconnect=lambda c: first.append("ab"))
+    b = networking.Server("localhost", _free_port(), 1024, "pickle", 4,
+                          on_connect=lambda c: second.append("an"))
+    try:
+        ca = networking.Client("localhost", a.port, 1024, "pickle", debug=0)
+        cb = networking.Client("localhost", b.port, 1024, "pickle", debug=0)
+        assert _wait_for(lambda: first == ["an"] and second == ["an"])
+        ca.close()
+        cb.close()
+        assert _wait_for(lambda: first == ["an", "ab"])
+        assert _wait_for(lambda: len(module_calls) == 1)  # b ohne on_disconnect: Modul-Hook
+    finally:
+        a.close()
+        b.close()
+
+
+def test_failing_hook_warns_and_keeps_server_running() -> None:
+    def broken(client: object) -> None:
+        raise ValueError("kaputt")
+
+    server = networking.Server("localhost", _free_port(), 1024, "pickle", 4, on_connect=broken)
+    try:
+        with pytest.warns(RuntimeWarning, match="kaputt"):
+            client = networking.Client("localhost", server.port, 1024, "pickle", debug=0)
+            assert _wait_for(lambda: client.name == "1")
+        client.close()
+    finally:
+        server.close()
+
+
+def test_communications_callbacks() -> None:
+    port = _free_port()
+    requests: list[object] = []
+    events: list[object] = []
+    host = communications.CommunicationsHandler(host=True, port=port, on_request=requests.append)
+    client = None
+    try:
+        client = communications.CommunicationsHandler(host=False, port=port, on_event=events.append)
+        assert _wait_for(lambda: client.getName() == "1")
+        client.sendRequest(communications.Request("frage", 1))
+        assert _wait_for(lambda: len(requests) == 1)
+        assert requests[0] == communications.Request("frage", 1)
+        assert len(host.getRequests()) == 1
+        host.castEvent(communications.Event("antwort", 2))
+        assert _wait_for(lambda: len(events) == 1)
+        assert len(client.getEvents()) == 1
+    finally:
+        if client is not None:
+            client.quit()
+        host.quit()

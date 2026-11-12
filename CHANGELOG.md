@@ -2,6 +2,15 @@
 
 Versionen nach [SemVer](https://semver.org/lang/de/). Datum TT.MM.JJJJ.
 
+## 1.2.0 – 12.11.2026
+
+Alles Neue ist ein Schlüsselwort-Parameter; alte Aufrufe verhalten sich gleich.
+
+### Neu
+- `max_frame` für `Server` und `Client` (Standard `DEFAULT_MAX_FRAME` = 16 MiB, `None` = keine Grenze). Kündigt die Gegenstelle einen größeren Rahmen an, wird nichts davon gelesen: `FrameTooLargeError` (eine `ConnectionError`), die Verbindung wird getrennt. Vorher konnte eine Gegenstelle im LAN mit einem großen Längenkopf den Speicher füllen.
+- `Server(on_connect=..., on_disconnect=...)`: Rückrufe für diesen Server allein. Ohne sie gelten wie bisher `networking.onConnect`/`onDisconnect`. Fehler in diesen Rückrufen werden als `RuntimeWarning` gemeldet und beenden den Empfangs-Thread nicht.
+- `CommunicationsHandler(on_request=..., on_event=...)`: wird im Empfangs-Thread gerufen, sobald ein Request (Host) oder Event (Client) ankommt. Die Warteschlangen bleiben; Fehler werden gewarnt.
+
 ## 1.1.1 – 11.11.2026
 
 Weniger Verzögerung, Verhalten unverändert.
